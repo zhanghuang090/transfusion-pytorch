@@ -13,7 +13,7 @@ i, j - sequence (row, col)
 """
 
 from functools import partial
-from typing import NamedTuple
+from typing import NamedTuple, Callable
 
 import torch
 from torch import nn, Tensor, tensor
@@ -27,6 +27,7 @@ from einops.layers.torch import Rearrange
 
 from rotary_embedding_torch import RotaryEmbedding, apply_rotary_emb
 
+from beartype import beartype
 from tqdm import tqdm
 
 pad_sequence = partial(pad_sequence, batch_first = True)
@@ -56,6 +57,8 @@ except ImportError:
 # constants
 
 ModalitySample = list[Int['_'] | Float['_ _'] | tuple[int, Float['_ _']]]
+
+ModalityTokenTransform = str | Callable | None
 
 RawModalityPositions = list[list[tuple[int, int]]]
 
@@ -278,7 +281,6 @@ def min_p_filter(logits, min_p = 0.1):
     limit = min_p * max_probs
     return torch.where(probs < limit, float('-inf'), logits)
 
-
 from torchdiffeq import odeint
 
 # random fourier embedding
@@ -303,6 +305,7 @@ class RandomFourierEmbed(Module):
 # from DiT paper and sota for time conditioning for now
 
 class AdaptiveWrapper(Module):
+    @beartype
     def __init__(
         self,
         fn: Module,
@@ -336,9 +339,12 @@ class AdaptiveWrapper(Module):
         self,
         x: Float['b n {self.dim}'],
         cond: Float['b {self.dim_cond}'] | Float['b n {self.dim_cond}'],
-        is_any_modality: Bool['b n'],
+        is_any_modality: bool | Bool['b n'],
         **kwargs
     ):
+        if isinstance(is_any_modality, bool):
+            is_any_modality = torch.full((x.shape[:-1]), is_any_modality, device = x.device, dtype = torch.bool)
+
         is_any_modality = rearrange(is_any_modality, '... -> ... 1')
 
         if cond.ndim == 2:
@@ -357,12 +363,24 @@ class AdaptiveWrapper(Module):
 
         out = self.fn(x, **kwargs)
 
+        multiple_returns = isinstance(out, tuple)
+
+        if multiple_returns:
+            out, *rest = out
+
         # take care of conditioning output separately for text vs modality
 
         text_out = out * (self.layerscale + 1.)
         modalities_out = out * self.to_ada_ln_zero(cond).sigmoid()
 
-        return torch.where(is_any_modality, modalities_out, text_out)
+        conditioned_out = torch.where(is_any_modality, modalities_out, text_out)
+
+        # take care of function returning cache
+
+        if not multiple_returns:
+            return conditioned_out
+
+        return (conditioned_out, *rest)
 
 # attention
 
@@ -432,6 +450,7 @@ class Attention(Module):
         x,
         attn_mask: Tensor | None = None,
         rotary_emb: Tensor | None = None,
+        cache: Tensor | None = None,
         block_mask = None,
         return_kv_cache = False
     ):
@@ -440,6 +459,13 @@ class Attention(Module):
         x = self.norm(x)
 
         q, k, v = self.to_qkv(x)
+
+        # handle cache being passed in
+
+        if exists(cache):
+            cached_k, cached_v = cache
+            k = torch.cat((cached_k, k), dim = -2)
+            v = torch.cat((cached_v, v), dim = -2)
 
         # maybe kv cache
 
@@ -488,6 +514,7 @@ class Attention(Module):
         return out, kv_cache
 
 class Transformer(Module):
+    @beartype
     def __init__(
         self,
         dim,
@@ -515,7 +542,11 @@ class Transformer(Module):
 
         layers = ModuleList([])
 
-        for _ in range(depth):
+        for ind in range(depth):
+            is_latter_half = ind >= (depth // 2)
+
+            skip_proj = Linear(dim * 2, dim, bias = False) if is_latter_half else None
+
             attn = Attention(dim = dim, dim_head = dim_head, heads = heads, dropout = dropout, use_flex_attn = use_flex_attn, **attn_kwargs)
 
             ff = FeedForward(dim = dim, expansion_factor = ff_expansion_factor, **ff_kwargs)
@@ -523,7 +554,7 @@ class Transformer(Module):
             attn = AdaptiveWrapper(attn, dim = dim, dim_cond = dim * 4)
             ff = AdaptiveWrapper(ff, dim = dim, dim_cond = dim * 4)
 
-            layers.append(ModuleList([attn, ff]))
+            layers.append(ModuleList([skip_proj, attn, ff]))
 
         self.layers = layers
         self.norm = RMSNorm(dim)
@@ -534,11 +565,13 @@ class Transformer(Module):
         times: Float[''] | Float['b'] | Float['b n'],
         attn_mask: Bool['b i j'] | None = None,
         modality_positions: RawModalityPositions | Int['b n 2'] | None = None,
-        is_any_modality: Bool['b n'] | None = None,
-        rotary_emb: Tensor | None = None
+        is_any_modality: bool | Bool['b n'] | None = None,
+        rotary_emb: Tensor | None = None,
+        cache: Tensor | None = None,
+        return_kv_cache = False
     ):
-        seq_len, device = x.shape[-2], x.device
-        assert exists(attn_mask) ^ exists(modality_positions)
+        batch, seq_len, device = x.shape[0], x.shape[-2], x.device
+        assert not (exists(attn_mask) and exists(modality_positions))
 
         # handle time
 
@@ -565,26 +598,73 @@ class Transformer(Module):
             is_any_modality = modality_positions_to_is_modality_mask(seq_len, modality_positions).any(dim = 1)
             is_any_modality = reduce(is_any_modality, 'b t n -> b n', 'any')
 
-        adaptive_kwargs = dict(cond = cond, is_any_modality = is_any_modality)
+        adaptive_kwargs = dict(
+            cond = cond,
+            is_any_modality = is_any_modality
+        )
+
+        # handle cache
+
+        cache = default(cache, (None,))
+        iter_cache = iter(cache)
 
         # transformer layers as usual, using mask from above
 
-        for attn, ff in self.layers:
-            x = attn(x, rotary_emb = rotary_emb, **attn_mask_kwargs, **adaptive_kwargs) + x
+        skips = []
+        new_cache = []
+
+        depth = len(self.layers)
+
+        for ind, (skip_proj, attn, ff) in enumerate(self.layers):
+            layer = ind + 1
+
+            # skip connection
+
+            is_first_half = layer <= (depth // 2)
+            is_later_half = not is_first_half
+
+            if is_first_half:
+                skips.append(x)
+
+            if is_later_half:
+                skip = skips.pop()
+                x = torch.cat((x, skip), dim = -1)
+                x = skip_proj(x)
+
+            # attention and feedforward
+
+            attn_out, kv_cache = attn(
+                x,
+                rotary_emb = rotary_emb,
+                cache = next(iter_cache, None),
+                return_kv_cache = True,
+                **attn_mask_kwargs,
+                **adaptive_kwargs
+            )
+
+            new_cache.append(kv_cache)
+
+            x = attn_out + x
             x = ff(x, **adaptive_kwargs) + x
 
-        return self.norm(x)
+        out = self.norm(x)
+
+        if not return_kv_cache:
+            return out
+
+        return out, torch.stack(new_cache)
 
 # classes
 
 class Transfusion(Module):
+    @beartype
     def __init__(
         self,
         *,
         num_text_tokens,
         transformer: dict | Transformer,
         dim_latent: int | tuple[int, ...] | None = None,
-        modality_token_transform: tuple[str | callable, ...] | None = None,
+        modality_token_transform: tuple[ModalityTokenTransform, ...] | ModalityTokenTransform = None,
         ignore_index = -1,
         diffusion_loss_weight = 1.,
         odeint_kwargs: dict = dict(
@@ -677,19 +757,25 @@ class Transfusion(Module):
         max_length = 8192,
         text_temperature = 1.5,
         text_min_p = 0.1,
+        cache_kv = False,
         modality_length = 32, # fix the modality token length for now, but this will be determined by the language model in a metadata tag
+        init_modality_noise: Float['n d'] | None = None,
         modality_steps = 16
     ) -> ModalitySample:
 
         device = self.device
 
         init_text_seq = tensor([self.sos_id], device = self.device)
-        modality_sample = [init_text_seq]
+        modality_sample = [init_text_seq, *default(prompt, [])]
 
         curr_length = 0
         curr_modality_id = None
         num_past_modalities = 0  # starts off with no modalities in output
+
+        text_is_greedy = text_temperature == 0.
         is_decoding_text = True  # starts off with text decoding, and alternates with modalities depending on [som] tokens detected
+
+        cache = None
 
         with tqdm(total = max_length) as pbar:
 
@@ -700,19 +786,32 @@ class Transfusion(Module):
 
                     *_, seq = modality_sample
 
-                    logits = self.forward([modality_sample], return_loss = False)
+                    logits, new_kv_cache = self.forward(
+                        [modality_sample],
+                        return_loss = False,
+                        cache = cache,
+                        decoding_text_or_modality = 'text',
+                        return_kv_cache = True
+                    )
+
                     logits = logits[0][-1]
 
-                    logits = min_p_filter(logits, min_p = text_min_p)
-                    probs = (logits / text_temperature).softmax(dim = -1)
+                    if text_is_greedy:
+                        sampled = logits.argmax(dim = -1, keepdim = True)
+                    else:
+                        logits = min_p_filter(logits, min_p = text_min_p)
 
-                    sampled = torch.multinomial(probs, 1)
+                        probs = (logits / text_temperature).softmax(dim = -1)
+                        sampled = torch.multinomial(probs, 1)
 
                     seq = torch.cat((seq, sampled), dim = -1)
                     modality_sample[-1] = seq
 
                     pbar.update(1)
                     curr_length += 1
+
+                    if cache_kv:
+                        cache = new_kv_cache
 
                     sampled_token_id = sampled.item()
 
@@ -728,16 +827,29 @@ class Transfusion(Module):
                     pbar.set_description(f'decoding modality [{curr_modality_id}]')
 
                     latent_dim = self.dim_latents[curr_modality_id]
-                    noise = torch.randn((modality_length, latent_dim), device = device)
+
+                    if exists(init_modality_noise):
+                        noise = init_modality_noise[:modality_length, :latent_dim]
+                    else:
+                        noise = torch.randn((modality_length, latent_dim), device = device)
+
+                    assert noise.shape == (modality_length, latent_dim)
+
+                    new_kv_cache = None
 
                     def ode_step_fn(step_times, denoised):
+                        nonlocal new_kv_cache
+
                         step_times = rearrange(step_times, ' -> 1 1') # batch size of 1
                         step_times = F.pad(step_times, (num_past_modalities, 0), value = 1.) # past decoded modalities receive a time conditioning of 1.
 
-                        embeds = self.forward(
+                        embeds, new_kv_cache = self.forward(
                             [[*modality_sample, (curr_modality_id, denoised)]],
                             times = step_times,
                             return_embed = True,
+                            cache = cache,
+                            return_kv_cache = True,
+                            decoding_text_or_modality = 'modality'
                         )
 
                         to_flow_pred = self.model_to_latent_preds[curr_modality_id]
@@ -758,6 +870,11 @@ class Transfusion(Module):
                     eom_id = self.eom_ids[curr_modality_id]
                     modality_sample.append(tensor([eom_id], device = device))
 
+                    # set kv cache if needed
+
+                    if cache_kv:
+                        cache = new_kv_cache
+
                     # back to decoding text
 
                     pbar.update(modality_length)
@@ -777,15 +894,21 @@ class Transfusion(Module):
             Callable[[Int['b m 3']], Float['b m']] | # allows a researcher to customize the times (noise level) based on the overall modality configuration of a sample
             None
         ) = None,
+        cache: Tensor | None = None,
+        decoding_text_or_modality: Literal['text', 'modality'] | None = None,
         return_loss = True,
         return_breakdown = False,
-        return_embed = False
+        return_embed = False,
+        return_kv_cache = False,
     ) -> (
         Float['b n l'] |
         Float['b n d'] |
+        tuple[Float['b n _'], list[Float['...']]] |
         Float[''] |
         tuple[Float[''], LossBreakdown]
     ):
+        is_decoding = exists(decoding_text_or_modality)
+
         return_loss &= not return_embed
 
         device = self.device
@@ -823,8 +946,16 @@ class Transfusion(Module):
                 else:
                     modality_type, modality_tensor = modality
 
+                    if not is_decoding:
+                        modality_transform = self.modality_token_transform[modality_type]
+                        modality_tensor = modality_transform(modality_tensor)
+
                     assert 0 <= modality_type < self.num_modalities, f'received a modality index that is out of range. only {self.num_modalities} modalities specified'
                     assert self.dim_latents[modality_type] == modality_tensor.shape[-1], f'mismatch for modality latent dimension - expected {self.dim_latents[modality_type]} but received {modality_tensor.shape[-1]}'
+
+                # auto move modality tensor to device of model
+
+                modality_tensor = modality_tensor.to(device)
 
                 length = modality_tensor.shape[0]
 
@@ -883,23 +1014,6 @@ class Transfusion(Module):
 
         if torch.is_tensor(modality_tokens):
             modality_tokens = [modality_tokens]
-
-        # transform the modality tokens from the vae encoder output into (batch, seq, feature) shape, if needed
-
-        transformed_modality_tokens = []
-
-        for batch_modality_tokens, batch_modality_position in zip(modality_tokens, modality_positions):
-            batch_transformed = []
-
-            for one_tokens, one_position in zip(batch_modality_tokens, batch_modality_position):
-                modality_type, _, _ = one_position
-                post_encode_transform = self.modality_token_transform[modality_type]
-                transformed = post_encode_transform(one_tokens)
-                batch_transformed.append(transformed)
-
-            transformed_modality_tokens.append(batch_transformed)
-
-        modality_tokens = transformed_modality_tokens
 
         # embed the modality tokens into one Tensor if not given as one
 
@@ -972,26 +1086,47 @@ class Transfusion(Module):
         rotary_emb = self.rotary_emb(rotary_positions)
         rotary_emb = rearrange(rotary_emb, 'b n d -> b 1 n d')
 
+        # take care of cache
+
+        is_any_modality_when_decoding = None
+
+        if exists(cache):
+            assert exists(decoding_text_or_modality)
+            is_any_modality_when_decoding = decoding_text_or_modality == 'modality'
+            modality_positions = None
+
+        # times
+
+        times = reduce(times, 'b t n -> b n', 'sum')
+
         # attention
 
-        embed = self.transformer(
+        embed, kv_cache = self.transformer(
             tokens,
-            times = reduce(times, 'b t n -> b n', 'sum'),
+            times = times,
             rotary_emb = rotary_emb,
-            modality_positions = modality_positions
+            modality_positions = modality_positions,
+            is_any_modality = is_any_modality_when_decoding,
+            return_kv_cache = True
         )
 
         # early return for embedding for decoding modality
 
         if return_embed:
-            return embed
+            if not return_kv_cache:
+                return embed
+
+            return embed, kv_cache
 
         # text unembedding
 
         text_logits = self.to_text_logits(embed)
 
         if not return_loss:
-            return text_logits
+            if not return_kv_cache:
+                return text_logits
+
+            return text_logits, kv_cache
 
         # calculate total tokens for weighing the loss
 
